@@ -7,10 +7,12 @@ M5EPD_Canvas canvas(&M5.EPD);
 M5EPD_Canvas status_canvas(&M5.EPD); 
 
 int selectedChoice = 0;
+bool submitted = false;
 
 const char* ssid = "Web3Showcase_AP";
 const char* password = "12345678";
-const char* stickc_ip = "http://192.168.4.2";
+const char* stickc_ip = "192.168.4.2";
+const char* port = "88";
 
 String choiceName(int choice) {
     if (choice == 1) {
@@ -26,15 +28,15 @@ String choiceName(int choice) {
     }
 }
 
-int choiceCoin(int choice) {
+String choiceCoin(int choice) {
     if (choice == 1) { // walk 1000 step
-        return 10;
+        return "10";
     } else if (choice == 2 || choice == 4) { // recycle bottle or reuse cup
-        return 5;
+        return "5";
     } else if (choice == 3) { // bike 1 km
-        return 20;
-    } else {
-        return 0;
+        return "20";
+    } else { // no c
+        return "0";
     }
 }
 
@@ -43,7 +45,7 @@ void drawMenu() {
     
     // Header
     canvas.setTextSize(4);
-    canvas.drawString("What did you do today?", 30, 50);
+    canvas.drawString("What did you do today?", 8, 50);
 
     canvas.setTextSize(3);
 
@@ -73,7 +75,7 @@ void drawMenu() {
         canvas.drawRect(0, yRect, 540, 80, 15);
         String name = String(i) + ". " + choiceName(i);
         canvas.drawString(name, 30, yString);
-        String coin = "   --> " + String(choiceCoin(i)) + " CCoin";
+        String coin = "   --> " + choiceCoin(i) + " CCoin";
         canvas.drawString(coin, 30, yString + 30);
         yRect += 100;
         yString += 100;
@@ -110,9 +112,26 @@ void sumbitStatus(String msg1, String msg2) {
 
     status_canvas.pushCanvas(0, 700, UPDATE_MODE_DU4); 
 
-    Serial.print("Status: ");
-    Serial.println(msg1);
-    Serial.println(msg2);
+    Serial.println("Submitted");
+}
+
+bool sendReceiveCoin(String coin) {
+    HTTPClient http;
+
+    String url = "http://" + String(stickc_ip) + ":" + String(port) + "/add_coin";
+    http.begin(url);
+    http.addHeader("Content-Type", "application/x-www-form-urlencoded");
+    String postData = "value=" + coin;
+
+    int code = http.POST(postData);
+    String response = http.getString();
+    http.end();
+    if (code == 200) {
+        Serial.println("Sent OK");
+        return true;
+    }
+    Serial.println(String(code) + " Error: " +  response);
+    return false;
 }
 
 void setup() {
@@ -144,32 +163,39 @@ void loop() {
             int x = M5.TP.readFingerX(0);
             int y = M5.TP.readFingerY(0);
 
-            Serial.printf("X: %d, Y: %d\n", x, y);
-
-            if (x >= 130 && x <= 229) {
-                selectedChoice = 1;
-                updateStatus("Selected: " + choiceName(selectedChoice));
-            }
-            else if (x >= 230 && x <= 329) {
-                selectedChoice = 2;
-                updateStatus("Selected: " + choiceName(selectedChoice));
-            }
-            else if (x >= 330 && x <= 410) {
-                selectedChoice = 3;
-                updateStatus("Selected: " + choiceName(selectedChoice));
-            }
-            else if (x >= 430 && x <= 510) {
-                selectedChoice = 4;
-                updateStatus("Selected: " + choiceName(selectedChoice));
-            }
-            // ปุ่ม Submit (เช็ค X ให้อยู่ในกรอบ 120-420)
-            else if (x >= 550 && x <= 650 && y >= 120 && y <= 420) { // 120 <= y <= 420 && 550 <= x <= 650
-                if (selectedChoice == 0) {
-                    updateStatus("Please select first!");
-                } else {
-                    String type = "--> " + choiceName(selectedChoice);
-                    String coin = "You'll receive: " + String(choiceCoin(selectedChoice)) + " CCoin";
-                    sumbitStatus(type, coin);
+            // Serial.printf("X: %d, Y: %d\n", x, y);
+            if (!submitted) {
+                if (x >= 130 && x <= 229) {
+                    selectedChoice = 1;
+                    updateStatus("Selected: " + choiceName(selectedChoice));
+                }
+                else if (x >= 230 && x <= 329) {
+                    selectedChoice = 2;
+                    updateStatus("Selected: " + choiceName(selectedChoice));
+                }
+                else if (x >= 330 && x <= 410) {
+                    selectedChoice = 3;
+                    updateStatus("Selected: " + choiceName(selectedChoice));
+                }
+                else if (x >= 430 && x <= 510) {
+                    selectedChoice = 4;
+                    updateStatus("Selected: " + choiceName(selectedChoice));
+                }
+                // ปุ่ม Submit (เช็ค X ให้อยู่ในกรอบ 120-420)
+                else if (x >= 550 && x <= 650 && y >= 120 && y <= 420) { // 120 <= y <= 420 && 550 <= x <= 650
+                    if (selectedChoice == 0) {
+                        updateStatus("Please select first!");
+                    } else {
+                        updateStatus("Submitting...");
+                        String type = "--> " + choiceName(selectedChoice);
+                        String coin = "You'll receive: " + choiceCoin(selectedChoice) + " CCoin";
+                        submitted = sendReceiveCoin(choiceCoin(selectedChoice));
+                        if (submitted) {
+                            sumbitStatus(type, coin);
+                        } else {
+                            updateStatus("Error sending coin.");
+                        }
+                    }
                 }
             }
             delay(100);
