@@ -143,7 +143,7 @@ void setup() {
             
             request->send(200, "text/plain", "Username '" + username + "' submitted successfully. Please wait for StickC update.");
             
-            // 7a. ส่งข้อมูล Username ไปให้ StickC
+            // ส่งข้อมูล Username ไปให้ StickC
             sendUsernameToStickC(username);
             
         } else {
