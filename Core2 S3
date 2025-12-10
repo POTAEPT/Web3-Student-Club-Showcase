@@ -1,0 +1,265 @@
+#include <M5Core2.h>
+#include <WiFi.h>
+#include <HTTPClient.h>
+#include <AsyncTCP.h>
+#include <ESPAsyncWebServer.h>
+#include <DNSServer.h>
+#include <esp_wifi.h>
+#include <esp_task_wdt.h>
+#include <qrcode.h>
+#include "config.h"
+#include "Participant.h"
+
+DNSServer dnsServer;
+AsyncWebServer server(80);
+Participant participant;
+
+const int QR_WIDTH = 180;
+const int QR_X = (320 - QR_WIDTH) / 2;
+
+bool shouldSyncUser = false;
+bool hasClientConnected = false;
+int previousClientCount = 0;
+
+unsigned long lastMemoryCheck = 0;
+unsigned long lastClientCheck = 0;
+const unsigned long MEMORY_CHECK_INTERVAL = 10000;
+
+// --- HTML Content (เหมือนเดิม) ---
+const char index_html[] PROGMEM = R"rawliteral(
+<!DOCTYPE html>
+<html>
+<head>
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Web3 Student Club</title>
+    <style>
+        body { font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; text-align: center; background-color: #f4f4f9; padding-top: 50px; margin: 0; }
+        .container { background: white; max-width: 350px; margin: 0 auto; padding: 30px; border-radius: 15px; box-shadow: 0 4px 6px rgba(0,0,0,0.1); }
+        h1 { color: #333; margin-bottom: 20px; font-size: 24px; }
+        p { color: #666; margin-bottom: 30px; }
+        input[type="text"] { width: 100%; padding: 12px; margin-bottom: 20px; border: 1px solid #ddd; border-radius: 8px; box-sizing: border-box; font-size: 16px; }
+        button { background-color: #007bff; color: white; padding: 14px 20px; border: none; border-radius: 8px; cursor: pointer; width: 100%; font-size: 18px; font-weight: bold; transition: background 0.3s; }
+        button:hover { background-color: #0056b3; }
+        .footer { margin-top: 20px; font-size: 12px; color: #999; }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>Web3 Student Club</h1>
+        <p>Enter your unique username to generate your event identity.</p>
+        <form action="/submit_identity" method="POST">
+            <input type="text" name="username" placeholder="Username (e.g. Alice)" required minlength="3" autofocus>
+            <button type="submit">Create Identity</button>
+        </form>
+        <div class="footer">Station 1: Identity Creation</div>
+    </div>
+</body>
+</html>
+)rawliteral";
+
+const char success_html[] PROGMEM = R"rawliteral(
+<!DOCTYPE html>
+<html>
+<head>
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <style>
+        body { font-family: sans-serif; text-align: center; padding-top: 50px; background-color: #e8f5e9; }
+        .card { background: white; padding: 30px; border-radius: 15px; display: inline-block; box-shadow: 0 4px 6px rgba(0,0,0,0.1); }
+        h1 { color: #2e7d32; }
+        p { font-size: 18px; color: #333; }
+    </style>
+</head>
+<body>
+    <div class="card">
+        <h1>Identity Created!</h1>
+        <p>Please check your Wearable.</p>
+        <p>Proceed to Station 2.</p>
+    </div>
+</body>
+</html>
+)rawliteral";
+
+// --- QR Helper ---
+void drawQRCode(const char* text, int x_start, int y_start, int size, int scale) {
+    QRCode qrcode;
+    uint8_t qrcodeData[qrcode_getBufferSize(3)];
+    qrcode_initText(&qrcode, qrcodeData, 3, 0, text);
+    int qr_size = qrcode.size;
+    M5.Lcd.fillRect(x_start - 5, y_start - 5, (qr_size * scale) + 10, (qr_size * scale) + 10, WHITE);
+    for (uint8_t y = 0; y < qr_size; y++) {
+        for (uint8_t x = 0; x < qr_size; x++) {
+            if (qrcode_getModule(&qrcode, x, y)) {
+                M5.Lcd.fillRect(x_start + (x * scale), y_start + (y * scale), scale, scale, BLACK);
+            }
+        }
+    }
+}
+
+// --- Sync Helper ---
+void syncUserToStations() {
+    String postData = "username=" + participant.Username;
+    Serial.printf("Sending Username: '%s'\n", participant.Username.c_str());
+
+    {
+        WiFiClient client;
+        HTTPClient http;
+        http.setReuse(false);
+        http.setTimeout(2000); 
+        if (http.begin(client, "http://" + IP_STICKC.toString() + ENDPOINT_SET_USER)) {
+            http.addHeader("Content-Type", "application/x-www-form-urlencoded");
+            int code = http.POST(postData);
+            Serial.printf("StickC Response: %d\n", code);
+            http.end(); 
+        }
+        client.stop();
+    }
+
+    {
+        WiFiClient client;
+        HTTPClient http;
+        http.setReuse(false);
+        http.setTimeout(2000);
+        if (http.begin(client, "http://" + IP_STATION2_MON.toString() + ENDPOINT_SET_USER)) {
+            http.addHeader("Content-Type", "application/x-www-form-urlencoded");
+            int code = http.POST(postData);
+            Serial.printf("Station2 Response: %d\n", code);
+            http.end();
+        }
+        client.stop();
+    }
+}
+
+void drawUI() {
+    M5.Lcd.fillScreen(BLACK);
+    if (participant.Username == "") {
+        M5.Lcd.setTextDatum(TC_DATUM);
+        M5.Lcd.setTextColor(WHITE, BLACK);
+        M5.Lcd.setTextFont(4);
+        M5.Lcd.drawString("Station 1: Identity", 160, 10);
+        
+        if (!hasClientConnected) {
+            M5.Lcd.setTextFont(3);
+            M5.Lcd.setTextColor(YELLOW, BLACK);
+            M5.Lcd.drawString("STEP 1", 160, 50);
+            M5.Lcd.setTextFont(2);
+            M5.Lcd.drawString("Scan to Connect WiFi", 160, 40);
+            String wifiQR = "WIFI:S:" + String(AP_SSID) + ";T:nopass;;"; 
+            drawQRCode(wifiQR.c_str(), (320-145)/2, 70, 1, 5);
+        } else {
+            M5.Lcd.setTextFont(3);
+            M5.Lcd.setTextColor(GREEN, BLACK);
+            M5.Lcd.drawString("STEP 2", 160, 50);
+            M5.Lcd.setTextFont(2);
+            M5.Lcd.drawString("Scan to Open Portal", 160, 40);
+            String webQR = "http://192.168.4.1";
+            drawQRCode(webQR.c_str(), (320-145)/2, 70, 1, 5);
+        }
+    } else {
+        M5.Lcd.setTextDatum(MC_DATUM);
+        M5.Lcd.setTextColor(GREEN, BLACK);
+        M5.Lcd.setTextFont(4);
+        M5.Lcd.drawString("ID Created!", 160, 100);
+        M5.Lcd.setTextColor(WHITE, BLACK);
+        M5.Lcd.drawString(participant.Username, 160, 140);
+        M5.Lcd.setTextFont(2);
+        M5.Lcd.drawString("Proceed to Station 2", 160, 180);
+    }
+}
+
+void setupWebHandlers() {
+    // --- [สำคัญ] iOS Handler - ตอบ 200 OK ทันที (แก้หมุนติ้ว) ---
+    // Apple Devices จะเช็ค URL พวกนี้
+    auto appleHandler = [](AsyncWebServerRequest *request){
+        Serial.println("[Captive] iOS Probe Detected");
+        AsyncWebServerResponse *response = request->beginResponse_P(200, "text/html", index_html);
+        response->addHeader("Cache-Control", "no-cache, no-store, must-revalidate");
+        request->send(response);
+    };
+    
+    server.on("/hotspot-detect.html", HTTP_GET, appleHandler);
+    server.on("/hotspot-detect.html", HTTP_POST, appleHandler); // เผื่อบางรุ่นส่ง POST
+    server.on("/success.html", HTTP_GET, appleHandler);
+
+    // --- Android Handler ---
+    auto androidHandler = [](AsyncWebServerRequest *request){
+        request->send(200, "text/html", "<!DOCTYPE html><html><head><meta http-equiv='refresh' content='0;url=http://192.168.4.1/'></head><body>Redirecting...</body></html>");
+    };
+    server.on("/generate_204", HTTP_GET, androidHandler);
+    server.on("/gen_204", HTTP_GET, androidHandler);
+    server.on("/mobile/status.php", HTTP_GET, androidHandler);
+
+    // --- Main Page ---
+    server.on("/", HTTP_GET, [](AsyncWebServerRequest *request){
+        AsyncWebServerResponse *response = request->beginResponse_P(200, "text/html", index_html);
+        response->addHeader("Cache-Control", "no-cache, no-store, must-revalidate");
+        request->send(response);
+    });
+
+    // --- Form Submit ---
+    server.on("/submit_identity", HTTP_POST, [](AsyncWebServerRequest *request){
+        if (request->hasParam("username", true)) {
+            String inputName = request->getParam("username", true)->value();
+            participant.reset();
+            participant.Username = inputName;
+            shouldSyncUser = true; 
+            drawUI();
+            request->send_P(200, "text/html", success_html);
+        } else {
+            request->send(400, "text/plain", "Missing Username");
+        }
+    });
+
+    // --- Reset ---
+    server.on(ENDPOINT_RESET_GLOBAL, HTTP_POST, [](AsyncWebServerRequest *request){
+        participant.reset();
+        participant.Username = "";
+        hasClientConnected = false;
+        previousClientCount = 0;
+        esp_wifi_deauth_sta(0); 
+        drawUI();
+        request->send(200, "application/json", "{\"status\":\"success\"}");
+    });
+
+    // --- [จุดแก้ปัญหาหมุนติ้ว] Catch-All (NotFound) ---
+    // แทนที่จะ Redirect -> ให้ส่งหน้าเว็บกลับไปเลย (200 OK)
+    // iOS จะได้ไม่ต้องวิ่งรอบสอง
+    server.onNotFound([](AsyncWebServerRequest *request){
+        AsyncWebServerResponse *response = request->beginResponse_P(200, "text/html", index_html);
+        response->addHeader("Cache-Control", "no-cache, no-store, must-revalidate");
+        request->send(response);
+    });
+}
+
+void setup() {
+    M5.begin(true, false, true, true);
+    Serial.begin(115200);
+    
+    // Watchdog
+    esp_task_wdt_init(30, true);
+    esp_task_wdt_add(NULL);
+
+    WiFi.mode(WIFI_OFF);
+    delay(100);
+    
+    WiFi.mode(WIFI_AP);
+    WiFi.softAPConfig(IP_STATION1_AP, IP_STATION1_AP, NETMASK);
+    WiFi.softAP(AP_SSID, AP_PASSWORD, 1, 0, 10);
+    
+    // Max Performance
+    esp_wifi_set_ps(WIFI_PS_NONE);
+    esp_wifi_set_bandwidth(WIFI_IF_AP, WIFI_BW_HT20);
+
+    // DNS Server
+    dnsServer.start(53, "*", IP_STATION1_AP);
+    
+    setupWebHandlers();
+    server.begin();
+
+    Serial.println("\n>>> SYSTEM READY (iOS Optimized) <<<");
+    Serial.printf("AP: %s | IP: %s\n", AP_SSID, WiFi.softAPIP().toString().c_str());
+
+    drawUI();
+}
+
+void loop() {
+    M5.update();
